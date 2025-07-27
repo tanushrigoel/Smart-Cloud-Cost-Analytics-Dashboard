@@ -1,0 +1,320 @@
+# Dockerfile
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o cost-analytics main.go
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+
+COPY --from=builder /app/cost-analytics .
+
+EXPOSE 8080
+CMD ["./cost-analytics"]
+
+---
+# docker-compose.yml
+version: '3.8'
+
+services:
+  cost-analytics:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - BQ_DATASET_ID=${BQ_DATASET_ID}
+      - BQ_TABLE_ID=${BQ_TABLE_ID}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro
+    restart: unless-stopped
+
+---
+# cloudbuild.yaml - For Google Cloud Build
+steps:
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/cost-analytics:$BUILD_ID', '.']
+  
+  # Push to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/cost-analytics:$BUILD_ID']
+  
+  # Deploy to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'cost-analytics'
+      - '--image=gcr.io/$PROJECT_ID/cost-analytics:$BUILD_ID'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,BQ_DATASET_ID=billing_data,BQ_TABLE_ID=gcp_billing_export'
+
+images:
+  - 'gcr.io/$PROJECT_ID/cost-analytics:$BUILD_ID'
+
+---
+# terraform/main.tf - Infrastructure as Code
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 4.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# BigQuery Dataset for billing data
+resource "google_bigquery_dataset" "billing_dataset" {
+  dataset_id  = "billing_data"
+  description = "Dataset for GCP billing export and cost analytics"
+  location    = "US"
+
+  access {
+    role          = "OWNER"
+    user_by_email = var.service_account_email
+  }
+}
+
+# Cloud Storage bucket for billing export
+resource "google_storage_bucket" "billing_bucket" {
+  name          = "${var.project_id}-billing-export"
+  location      = "US"
+  force_destroy = true
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+
+# Service Account for the application
+resource "google_service_account" "cost_analytics_sa" {
+  account_id   = "cost-analytics"
+  display_name = "Cost Analytics Service Account"
+  description  = "Service account for cost analytics application"
+}
+
+# IAM bindings for BigQuery
+resource "google_project_iam_member" "bigquery_user" {
+  project = var.project_id
+  role    = "roles/bigquery.user"
+  member  = "serviceAccount:${google_service_account.cost_analytics_sa.email}"
+}
+
+resource "google_project_iam_member" "bigquery_data_viewer" {
+  project = var.project_id
+  role    = "roles/bigquery.dataViewer"
+  member  = "serviceAccount:${google_service_account.cost_analytics_sa.email}"
+}
+
+# Cloud Run service
+resource "google_cloud_run_service" "cost_analytics" {
+  name     = "cost-analytics"
+  location = var.region
+
+  template {
+    spec {
+      service_account_name = google_service_account.cost_analytics_sa.email
+      
+      containers {
+        image = "gcr.io/${var.project_id}/cost-analytics:latest"
+        
+        env {
+          name  = "GCP_PROJECT_ID"
+          value = var.project_id
+        }
+        
+        env {
+          name  = "BQ_DATASET_ID"
+          value = google_bigquery_dataset.billing_dataset.dataset_id
+        }
+        
+        env {
+          name  = "BQ_TABLE_ID"
+          value = "gcp_billing_export"
+        }
+
+        resources {
+          limits = {
+            cpu    = "1000m"
+            memory = "512Mi"
+          }
+        }
+
+        ports {
+          container_port = 8080
+        }
+      }
+    }
+
+    metadata {
+      annotations = {
+        "autoscaling.knative.dev/maxScale" = "10"
+        "run.googleapis.com/cpu-throttling" = "false"
+      }
+    }
+  }
+
+  traffic {
+    percent         = 100
+    latest_revision = true
+  }
+}
+
+# Make Cloud Run service publicly accessible
+resource "google_cloud_run_service_iam_binding" "public" {
+  location = google_cloud_run_service.cost_analytics.location
+  project  = google_cloud_run_service.cost_analytics.project
+  service  = google_cloud_run_service.cost_analytics.name
+  role     = "roles/run.invoker"
+  members = [
+    "allUsers",
+  ]
+}
+
+# Cloud Scheduler job for daily updates
+resource "google_cloud_scheduler_job" "daily_update" {
+  name             = "cost-analytics-daily-update"
+  description      = "Daily cost analytics update"
+  schedule         = "0 9 * * *"
+  time_zone        = "America/New_York"
+  attempt_deadline = "300s"
+
+  http_target {
+    http_method = "POST"
+    uri         = "${google_cloud_run_service.cost_analytics.status[0].url}/api/update-sheets?spreadsheet_id=${var.sheets_id}"
+  }
+}
+
+# Variables
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+
+variable "region" {
+  description = "GCP Region"
+  type        = string
+  default     = "us-central1"
+}
+
+variable "service_account_email" {
+  description = "Service account email for BigQuery access"
+  type        = string
+}
+
+variable "sheets_id" {
+  description = "Google Sheets spreadsheet ID for dashboard"
+  type        = string
+}
+
+# Outputs
+output "cloud_run_url" {
+  value = google_cloud_run_service.cost_analytics.status[0].url
+}
+
+output "service_account_email" {
+  value = google_service_account.cost_analytics_sa.email
+}
+
+---
+# scripts/setup.sh
+#!/bin/bash
+
+set -e
+
+PROJECT_ID=${1:-"your-project-id"}
+REGION=${2:-"us-central1"}
+
+echo "Setting up Cost Analytics Dashboard for project: $PROJECT_ID"
+
+# Enable required APIs
+echo "Enabling required APIs..."
+gcloud services enable bigquery.googleapis.com \
+    cloudbuild.googleapis.com \
+    run.googleapis.com \
+    sheets.googleapis.com \
+    cloudscheduler.googleapis.com \
+    --project=$PROJECT_ID
+
+# Create BigQuery billing export (manual step required)
+echo "
+MANUAL STEP REQUIRED:
+1. Go to Google Cloud Console > Billing > Billing Export
+2. Create a BigQuery export with:
+   - Project: $PROJECT_ID
+   - Dataset: billing_data
+   - Table: gcp_billing_export
+3. Wait 24-48 hours for data to populate
+"
+
+# Set up Terraform
+echo "Initializing Terraform..."
+cd terraform
+terraform init
+terraform plan -var="project_id=$PROJECT_ID" -var="region=$REGION"
+
+echo "
+Setup complete! Next steps:
+1. Configure billing export (see manual step above)
+2. Run 'terraform apply' to deploy infrastructure
+3. Build and deploy the application with 'gcloud builds submit'
+4. Create Google Sheets dashboard and update spreadsheet_id
+"
+
+---
+# go.mod
+module cost-analytics
+
+go 1.21
+
+require (
+    cloud.google.com/go/bigquery v1.57.1
+    github.com/gorilla/mux v1.8.0
+    google.golang.org/api v0.149.0
+)
+
+require (
+    cloud.google.com/go v0.110.8 // indirect
+    cloud.google.com/go/compute v1.23.1 // indirect
+    cloud.google.com/go/compute/metadata v0.2.3 // indirect
+    cloud.google.com/go/iam v1.1.3 // indirect
+    cloud.google.com/go/longrunning v0.5.2 // indirect
+    github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
+    github.com/golang/protobuf v1.5.3 // indirect
+    github.com/google/s2a-go v0.1.7 // indirect
+    github.com/google/uuid v1.3.1 // indirect
+    github.com/googleapis/enterprise-certificate-proxy v0.3.2 // indirect
+    github.com/googleapis/gax-go/v2 v2.12.0 // indirect
+    go.opencensus.io v0.24.0 // indirect
+    golang.org/x/crypto v0.14.0 // indirect
+    golang.org/x/net v0.17.0 // indirect
+    golang.org/x/oauth2 v0.13.0 // indirect
+    golang.org/x/sync v0.4.0 // indirect
+    golang.org/x/sys v0.13.0 // indirect
+    golang.org/x/text v0.13.0 // indirect
+    golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
+    google.golang.org/appengine v1.6.7 // indirect
+    google.golang.org/genproto v0.0.0-20231016165738-49dd2c1
